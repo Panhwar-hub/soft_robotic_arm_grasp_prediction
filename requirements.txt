@@ -1,0 +1,15 @@
+# Tested with Python 3.10.
+# Pinned to what the model was trained/saved with -- scikit-learn pickles
+# (joblib) can fail to load across major version jumps, so keep these exact
+# for now. If you need to loosen them later, retrain with train_model.py
+# afterwards to regenerate model.joblib against the new versions.
+pandas==2.3.3
+numpy==2.2.6
+scipy==1.15.3
+scikit-learn==1.7.2
+joblib==1.6.0
+
+# for arduino_signal.py (recorder) and classify_gui.py (live classifier GUI)
+matplotlib==3.10.9
+pyserial==3.5
+Pillow==12.3.0
