@@ -96,6 +96,7 @@ def extract_features(t, ch0, ch1, ch2):
 CHANNEL_COLUMN_ALIASES = [
     ("CH0_pF", "CH1_pF", "CH2_pF"),
     ("Sensor1_pF", "Sensor2_pF", "Sensor3_pF"),
+    ("PressureSensor1_CH0_pF", "PressureSensor2_CH1_pF", "PressureSensor3_CH2_pF"),
 ]
 
 

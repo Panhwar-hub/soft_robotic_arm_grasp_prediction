@@ -1,0 +1,21 @@
+# Python environments and interpreter caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+
+# Generated training and experiment outputs
+model_artifacts/
+*.log
+*_results.json
+*_summary.json
+
+# Optional local configuration
+.env
+.env.*
+!.env.example

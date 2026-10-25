@@ -1,20 +1,26 @@
 """
 Live grasp classifier GUI for the Universal Arm capacitive-sensor setup.
 
+Visual style matches arduino_signal.py on purpose (same 3-channel live plot,
+same right-hand object panel, same button layout) so it feels like part of
+the same toolkit -- just for classifying instead of recording.
+
 This is a SEPARATE program from arduino_signal.py -- that recorder is left
-completely untouched so the CSV recordings it produces (and any future
-recordings you make with it) stay in the exact same format the model was
+completely untouched, so the CSV recordings it produces (and any future
+recordings you make with it) stay in exactly the format the model was
 trained on. This script opens its OWN serial connection to the same ESP32
-and reuses the identical packet-parsing rules (see parse_packet() below,
-copied from arduino_signal.py on purpose) so the raw numbers it sees are
-exactly the numbers arduino_signal.py would have written to a CSV.
+and reuses the identical packet-parsing rule (parse_packet() below, copied
+from arduino_signal.py on purpose -- if you ever change the ESP32 firmware's
+packet format, update BOTH copies) so the raw numbers it sees are exactly
+the numbers arduino_signal.py would have written to a CSV.
 
 Workflow:
-  1. Pick the ESP32's serial port and click Connect.
-  2. Hold/present an object to the arm, click "Start Grasp".
-  3. When the grasp is done, click "Stop && Classify".
-  4. A pop-up window shows the predicted object (Ball / Square box /
-     Triangular) with its picture from assets/, plus the model's confidence.
+  1. Run the script, pick the ESP32's serial port when prompted.
+  2. Click "START GRASP", present/hold the object to the arm.
+  3. Click "STOP & CLASSIFY" when the grasp is done.
+  4. The matching object panel on the right lights up green, the prediction
+     + confidence are printed next to it, and a pop-up window shows the
+     object's photo full-size.
 
 The classification itself (preprocessing, feature extraction, the trained
 model) is 100% delegated to evaluate.py / feature_extraction.py in this same
@@ -25,14 +31,13 @@ import os
 import sys
 import time
 import csv
-import queue
-import threading
-import tkinter as tk
-from tkinter import ttk, messagebox
+from collections import deque
 
-import serial
-import serial.tools.list_ports
-from PIL import Image, ImageTk
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
+from PIL import Image, ImageOps
 
 from evaluate import predict_from_raw
 
@@ -40,42 +45,71 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(HERE, "assets")
 LOG_PATH = os.path.join(HERE, "live_classification_log.csv")
 
-BAUD_RATE = 115200
-SELECTED_CHANNELS = [0, 1, 2]   # same as arduino_signal.py
-MIN_SAMPLES_TO_CLASSIFY = 8      # extract_features() itself requires >= 8
+# ============================================================
+# USER SETTINGS -- kept the same as arduino_signal.py
+# ============================================================
 
-# object name (as the model outputs it) -> image file in assets/
-# matched by keyword so small label-string variations don't break it
-IMAGE_KEYWORDS = [
-    ("ball", "ball.jpeg"),
-    ("square", "square.jpg"),
-    ("triangl", "triangle.jpeg"),
-]
+BAUD_RATE = 115200
+SELECTED_CHANNELS = [0, 1, 2]
+WINDOW_SIZE = 300          # samples kept on screen for the live plot
+GRAPH_INTERVAL_MS = 50
+MIN_SAMPLES_TO_CLASSIFY = 8  # extract_features() itself requires >= 8
+
+ITEMS = ["Square box", "Triangular", "Ball"]  # same objects/order as arduino_signal.py
+
+IMAGE_FILES = {
+    "Square box": "square.jpg",
+    "Triangular": "triangle.jpeg",
+    "Ball": "ball.jpeg",
+}
+# fallback keyword matcher, in case the model's exact class strings ever
+# drift from the ITEMS list above (e.g. after retraining on relabeled data)
+IMAGE_KEYWORDS = [("ball", "ball.jpeg"), ("square", "square.jpg"), ("triang", "triangle.jpeg")]
 
 
 def image_path_for_label(label):
+    fname = IMAGE_FILES.get(label)
+    if fname and os.path.exists(os.path.join(ASSETS_DIR, fname)):
+        return os.path.join(ASSETS_DIR, fname)
     norm = label.lower()
-    for keyword, filename in IMAGE_KEYWORDS:
-        if keyword in norm:
-            path = os.path.join(ASSETS_DIR, filename)
+    for kw, fname in IMAGE_KEYWORDS:
+        if kw in norm:
+            path = os.path.join(ASSETS_DIR, fname)
             if os.path.exists(path):
                 return path
     return None
 
 
+_thumb_cache = {}
+
+
+def load_thumbnail(label, size=(220, 220)):
+    """Loads + center-crops an object photo to a square so the panels line
+    up neatly regardless of the source photo's aspect ratio. Cached so the
+    live 20fps redraw loop never touches disk."""
+    key = (label, size)
+    if key in _thumb_cache:
+        return _thumb_cache[key]
+    path = image_path_for_label(label)
+    if path is None:
+        _thumb_cache[key] = None
+        return None
+    im = Image.open(path).convert("RGB")
+    im = ImageOps.fit(im, size, Image.LANCZOS)
+    arr = np.asarray(im)
+    _thumb_cache[key] = arr
+    return arr
+
+
 # ============================================================
-# PACKET PARSER -- identical logic to arduino_signal.py's parse_packet(),
-# duplicated here (not imported) so arduino_signal.py never has to change.
-# If you ever change the ESP32 firmware's packet format, update BOTH copies.
+# PACKET PARSER -- identical logic to arduino_signal.py's parse_packet()
 # ============================================================
 
 def parse_packet(line, selected_channels=SELECTED_CHANNELS):
     if not line:
         return None, None
-
     payload = line[1:] if line.startswith("$") else line
     parts = [x.strip() for x in payload.split(",")]
-
     try:
         numbers = [float(x) for x in parts]
     except ValueError:
@@ -92,97 +126,11 @@ def parse_packet(line, selected_channels=SELECTED_CHANNELS):
         fmt = "3 sensors"
     else:
         return None, None
-
     return values, fmt
 
 
-# ============================================================
-# BACKGROUND SERIAL READER
-# ============================================================
-
-class SerialReader(threading.Thread):
-    """Reads lines from the serial port on a background thread and pushes
-    (program_time, s1, s2, s3) tuples onto a thread-safe queue. Keeping this
-    off the Tk main thread keeps the GUI responsive."""
-
-    def __init__(self, port, baud, out_queue):
-        super().__init__(daemon=True)
-        self.out_queue = out_queue
-        self._stop_flag = threading.Event()
-        self.ser = serial.Serial(port, baud, timeout=0.05)
-        time.sleep(2)
-        self.ser.reset_input_buffer()
-        self._t0 = time.perf_counter()
-        self.last_error = None
-
-    def stop(self):
-        self._stop_flag.set()
-
-    def run(self):
-        while not self._stop_flag.is_set():
-            try:
-                raw = self.ser.readline()
-            except Exception as e:
-                self.last_error = str(e)
-                break
-            if not raw:
-                continue
-            line = raw.decode("utf-8", errors="ignore").strip()
-            if not line:
-                continue
-            values, fmt = parse_packet(line)
-            if values is None:
-                continue
-            t = time.perf_counter() - self._t0
-            self.out_queue.put((t, values[0], values[1], values[2], fmt))
-        try:
-            self.ser.close()
-        except Exception:
-            pass
-
-
-# ============================================================
-# GRASP BUFFER + CLASSIFICATION
-# ============================================================
-
-class GraspBuffer:
-    """Collects samples for one grasp trial (mirrors what arduino_signal.py
-    writes to a CSV, just kept in memory instead)."""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.t, self.s1, self.s2, self.s3 = [], [], [], []
-        self._t0 = None
-
-    def add(self, program_time, s1, s2, s3):
-        if self._t0 is None:
-            self._t0 = program_time
-        self.t.append(program_time - self._t0)
-        self.s1.append(s1)
-        self.s2.append(s2)
-        self.s3.append(s3)
-
-    def __len__(self):
-        return len(self.t)
-
-
-def classify_grasp(buf: GraspBuffer):
-    """Runs the SAME preprocessing + feature extraction + model used in
-    training (via evaluate.predict_from_raw). Returns (label, proba_dict)."""
-    if len(buf) < MIN_SAMPLES_TO_CLASSIFY:
-        raise ValueError(
-            f"Only {len(buf)} samples captured (need at least {MIN_SAMPLES_TO_CLASSIFY}). "
-            f"Hold the grasp a little longer before clicking Stop && Classify."
-        )
-    label, proba = predict_from_raw(buf.t, buf.s1, buf.s2, buf.s3, return_proba=True)
-    return label, proba
-
-
 def log_prediction(label, proba, n_samples, duration_s):
-    """Small append-only audit trail of live predictions (not raw signal) --
-    handy for spotting a model that's drifting without re-opening the GUI."""
+    """Small append-only audit trail of live predictions (not raw signal)."""
     is_new = not os.path.exists(LOG_PATH)
     with open(LOG_PATH, "a", newline="") as fh:
         w = csv.writer(fh)
@@ -192,220 +140,328 @@ def log_prediction(label, proba, n_samples, duration_s):
 
 
 # ============================================================
-# GUI
+# FIGURE BUILDING -- pure functions, no serial/animation involved, so they
+# can be exercised head-to-head with a plain script (see test_gui_layout.py)
 # ============================================================
 
-class ClassifierApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Universal Arm - Live Grasp Classifier")
-        self.root.geometry("480x420")
-        self.root.resizable(False, False)
+def build_figure():
+    fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
+    plt.subplots_adjust(left=0.08, right=0.74, top=0.90, bottom=0.10, hspace=0.33)
+    fig.suptitle("Universal Arm - Live Grasp Classifier", fontsize=18)
 
-        self.reader = None
-        self.rx_queue = queue.Queue()
-        self.buffer = GraspBuffer()
-        self.capturing = False
-        self._last_sample = (0.0, 0.0, 0.0)
+    lines, value_texts = [], []
+    for i in range(3):
+        line, = axes[i].plot([], [], linewidth=2)
+        lines.append(line)
+        axes[i].set_title(f"Sensor {i + 1} - CH{SELECTED_CHANNELS[i]}")
+        axes[i].set_ylabel("Capacitance (pF)")
+        axes[i].grid(True)
+        vt = axes[i].text(0.02, 0.90, "Waiting...", transform=axes[i].transAxes, fontsize=11)
+        value_texts.append(vt)
+    axes[2].set_xlabel("Program Time (s)")
 
-        self._build_widgets()
-        self._poll_queue()
-
-    # ---------- layout ----------
-    def _build_widgets(self):
-        pad = {"padx": 10, "pady": 6}
-
-        conn = ttk.LabelFrame(self.root, text="Connection")
-        conn.pack(fill="x", **pad)
-
-        self.port_var = tk.StringVar()
-        self.port_combo = ttk.Combobox(conn, textvariable=self.port_var, state="readonly", width=28)
-        self.port_combo.grid(row=0, column=0, padx=6, pady=6)
-        self._refresh_ports()
-
-        ttk.Button(conn, text="Refresh", command=self._refresh_ports).grid(row=0, column=1, padx=4)
-        self.connect_btn = ttk.Button(conn, text="Connect", command=self._toggle_connect)
-        self.connect_btn.grid(row=0, column=2, padx=4)
-
-        live = ttk.LabelFrame(self.root, text="Live sensor readout (pF)")
-        live.pack(fill="x", **pad)
-        self.live_labels = []
-        for i in range(3):
-            lbl = ttk.Label(live, text=f"Sensor {i+1}: --", font=("TkDefaultFont", 12))
-            lbl.grid(row=0, column=i, padx=16, pady=8)
-            self.live_labels.append(lbl)
-
-        ctrl = ttk.LabelFrame(self.root, text="Grasp capture")
-        ctrl.pack(fill="x", **pad)
-        self.start_btn = ttk.Button(ctrl, text="Start Grasp", command=self._start_grasp, state="disabled")
-        self.start_btn.grid(row=0, column=0, padx=8, pady=8)
-        self.stop_btn = ttk.Button(ctrl, text="Stop && Classify", command=self._stop_and_classify, state="disabled")
-        self.stop_btn.grid(row=0, column=1, padx=8, pady=8)
-
-        self.status_var = tk.StringVar(value="Not connected.")
-        ttk.Label(self.root, textvariable=self.status_var, foreground="gray").pack(fill="x", **pad)
-
-        result = ttk.LabelFrame(self.root, text="Last result")
-        result.pack(fill="both", expand=True, **pad)
-        self.result_image_label = ttk.Label(result)
-        self.result_image_label.pack(pady=6)
-        self.result_text_var = tk.StringVar(value="No grasp classified yet.")
-        ttk.Label(result, textvariable=self.result_text_var, font=("TkDefaultFont", 12, "bold")).pack()
-
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _refresh_ports(self):
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        self.port_combo["values"] = ports
-        if ports and not self.port_var.get():
-            self.port_var.set(ports[0])
-
-    # ---------- connection ----------
-    def _toggle_connect(self):
-        if self.reader is None:
-            self._connect()
-        else:
-            self._disconnect()
-
-    def _connect(self):
-        port = self.port_var.get()
-        if not port:
-            messagebox.showerror("No port selected", "Pick a serial port first (click Refresh if the list is empty).")
-            return
-        try:
-            self.reader = SerialReader(port, BAUD_RATE, self.rx_queue)
-        except Exception as e:
-            messagebox.showerror("Connection failed", f"Could not open {port}:\n{e}\n\nClose the Arduino Serial Monitor / Plotter if it's open.")
-            self.reader = None
-            return
-        self.reader.start()
-        self.connect_btn.config(text="Disconnect")
-        self.start_btn.config(state="normal")
-        self.status_var.set(f"Connected on {port}. Waiting for data...")
-
-    def _disconnect(self):
-        if self.capturing:
-            self._stop_and_classify(silent=True)
-        if self.reader:
-            self.reader.stop()
-            self.reader = None
-        self.connect_btn.config(text="Connect")
-        self.start_btn.config(state="disabled")
-        self.stop_btn.config(state="disabled")
-        self.status_var.set("Disconnected.")
-
-    # ---------- grasp capture ----------
-    def _start_grasp(self):
-        self.buffer.reset()
-        self.capturing = True
-        self.start_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
-        self.status_var.set("Recording grasp... click Stop && Classify when done.")
-
-    def _stop_and_classify(self, silent=False):
-        self.capturing = False
-        self.start_btn.config(state="normal")
-        self.stop_btn.config(state="disabled")
-
-        try:
-            label, proba = classify_grasp(self.buffer)
-        except ValueError as e:
-            if not silent:
-                messagebox.showwarning("Grasp too short", str(e))
-            self.status_var.set("Grasp too short -- try again.")
-            return
-        except Exception as e:
-            if not silent:
-                messagebox.showerror("Classification failed", str(e))
-            self.status_var.set("Classification failed -- see error.")
-            return
-
-        duration = self.buffer.t[-1] - self.buffer.t[0] if len(self.buffer) > 1 else 0.0
-        log_prediction(label, proba, len(self.buffer), duration)
-
-        confidence = proba.get(label, 0.0)
-        self.status_var.set(f"Classified {len(self.buffer)} samples ({duration:.1f}s) as '{label}' ({confidence:.0%}).")
-        self._show_result(label, proba)
-        if not silent:
-            self._show_popup(label, confidence)
-
-    def _show_result(self, label, proba):
-        proba_str = "\n".join(f"{c}: {p:.1%}" for c, p in sorted(proba.items(), key=lambda kv: -kv[1]))
-        self.result_text_var.set(f"Predicted: {label}\n\n{proba_str}")
-        img = self._load_thumbnail(label, size=(160, 160))
+    # object panels, same coordinates arduino_signal.py used for its
+    # vector-drawn shapes -- now showing the actual object photos instead
+    coords = {
+        "Square box": [0.77, 0.73, 0.20, 0.16],
+        "Triangular": [0.77, 0.55, 0.20, 0.16],
+        "Ball": [0.77, 0.37, 0.20, 0.16],
+    }
+    image_axes = {}
+    for label, rect in coords.items():
+        ax = fig.add_axes(rect)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_linewidth(2.0)
+            spine.set_edgecolor("gray")
+        img = load_thumbnail(label, size=(200, 200))
         if img is not None:
-            self.result_image_label.config(image=img, text="")
-            self.result_image_label.image = img  # keep a reference, else Tk garbage-collects it
+            ax.imshow(img)
         else:
-            self.result_image_label.config(image="", text="(no image found for this label)")
+            ax.text(0.5, 0.5, "(no image)", ha="center", va="center", fontsize=9)
+        ax.set_title(label, fontsize=10, fontweight="bold")
+        image_axes[label] = ax
 
-    def _load_thumbnail(self, label, size):
-        path = image_path_for_label(label)
-        if path is None:
-            return None
-        im = Image.open(path)
-        im.thumbnail(size)
-        return ImageTk.PhotoImage(im)
+    pred_text = fig.text(0.77, 0.335, "Prediction: --\n(no grasp classified yet)", fontsize=10, va="top")
 
-    def _show_popup(self, label, confidence):
-        top = tk.Toplevel(self.root)
-        top.title("Grasp classified")
-        top.geometry("320x360")
-        top.resizable(False, False)
-        img = self._load_thumbnail(label, size=(240, 240))
-        if img is not None:
-            img_lbl = ttk.Label(top, image=img)
-            img_lbl.image = img
-            img_lbl.pack(pady=12)
-        ttk.Label(top, text=label, font=("TkDefaultFont", 18, "bold")).pack()
-        ttk.Label(top, text=f"confidence: {confidence:.0%}", foreground="gray").pack(pady=(2, 12))
-        ttk.Button(top, text="OK", command=top.destroy).pack(pady=4)
-        top.transient(self.root)
-        top.grab_set()
+    start_ax = fig.add_axes([0.77, 0.15, 0.20, 0.06])
+    start_button = Button(start_ax, "START GRASP")
 
-    # ---------- queue polling (runs on the Tk main thread) ----------
-    def _poll_queue(self):
-        latest = None
-        drained = 0
-        while True:
-            try:
-                item = self.rx_queue.get_nowait()
-            except queue.Empty:
-                break
-            t, s1, s2, s3, fmt = item
-            latest = (s1, s2, s3)
-            if self.capturing:
-                self.buffer.add(t, s1, s2, s3)
-            drained += 1
+    stop_ax = fig.add_axes([0.77, 0.07, 0.20, 0.06])
+    stop_button = Button(stop_ax, "STOP && CLASSIFY")
 
-        if latest is not None:
-            self.live_labels[0].config(text=f"Sensor 1: {latest[0]:.3f} pF")
-            self.live_labels[1].config(text=f"Sensor 2: {latest[1]:.3f} pF")
-            self.live_labels[2].config(text=f"Sensor 3: {latest[2]:.3f} pF")
+    status_text = fig.text(0.77, 0.012, "", fontsize=9, va="bottom")
 
-        if self.reader is not None and self.reader.last_error and self.reader.is_alive() is False:
-            messagebox.showerror("Serial error", self.reader.last_error)
-            self._disconnect()
+    return {
+        "fig": fig, "axes": axes, "lines": lines, "value_texts": value_texts,
+        "image_axes": image_axes, "pred_text": pred_text,
+        "start_button": start_button, "stop_button": stop_button,
+        "status_text": status_text,
+    }
 
-        if self.capturing:
-            self.status_var.set(f"Recording grasp... {len(self.buffer)} samples captured.")
 
-        self.root.after(50, self._poll_queue)
+def update_live_plot(handles, time_buffer, sensor_buffers):
+    axes, lines, value_texts = handles["axes"], handles["lines"], handles["value_texts"]
+    if len(time_buffer) == 0:
+        return
+    x = list(time_buffer)
+    for i in range(3):
+        y = list(sensor_buffers[i])
+        lines[i].set_data(x, y)
+        if y:
+            value_texts[i].set_text(f"{y[-1]:.4f} pF")
+        if len(x) > 1:
+            if x[-1] <= 30:
+                axes[i].set_xlim(0, 30)
+            else:
+                axes[i].set_xlim(x[-1] - 30, x[-1])
+        if len(y) > 2:
+            ymin, ymax = min(y), max(y)
+            diff = max(ymax - ymin, 0.01)
+            margin = diff * 0.20
+            axes[i].set_ylim(ymin - margin, ymax + margin)
 
-    def _on_close(self):
-        self._disconnect()
-        self.root.destroy()
+
+def highlight_prediction(handles, predicted_label):
+    for label, ax in handles["image_axes"].items():
+        for spine in ax.spines.values():
+            if label == predicted_label:
+                spine.set_edgecolor("limegreen")
+                spine.set_linewidth(4.0)
+            else:
+                spine.set_edgecolor("gray")
+                spine.set_linewidth(2.0)
+
+
+def set_prediction_text(handles, message=None, label=None, proba=None):
+    if message is not None:
+        handles["pred_text"].set_text(message)
+        return
+    lines_ = [f"Prediction: {label}", ""]
+    for c, p in sorted(proba.items(), key=lambda kv: -kv[1]):
+        lines_.append(f"  {c}: {p:.0%}")
+    handles["pred_text"].set_text("\n".join(lines_))
+
+
+def build_popup_figure(label, confidence):
+    img = load_thumbnail(label, size=(320, 320))
+    fig2 = plt.figure(figsize=(4.4, 5.2))
+    fig2.suptitle("Grasp classified", fontsize=14)
+    ax = fig2.add_axes([0.08, 0.26, 0.84, 0.64])
+    ax.set_xticks([])
+    ax.set_yticks([])
+    if img is not None:
+        ax.imshow(img)
+    else:
+        ax.text(0.5, 0.5, "(no image found)", ha="center", va="center")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("limegreen")
+        spine.set_linewidth(3.0)
+    fig2.text(0.5, 0.18, label, ha="center", fontsize=18, fontweight="bold")
+    fig2.text(0.5, 0.11, f"confidence: {confidence:.0%}", ha="center", fontsize=11, color="dimgray")
+    close_ax = fig2.add_axes([0.32, 0.03, 0.36, 0.06])
+    close_button = Button(close_ax, "Close")
+    close_button.on_clicked(lambda evt: plt.close(fig2))
+    fig2._close_button_ref = close_button  # keep a reference alive
+    return fig2
+
+
+# ============================================================
+# CLASSIFICATION GLUE
+# ============================================================
+
+def classify_grasp(t, s1, s2, s3):
+    if len(t) < MIN_SAMPLES_TO_CLASSIFY:
+        raise ValueError(
+            f"Only {len(t)} samples captured (need at least {MIN_SAMPLES_TO_CLASSIFY}). "
+            f"Hold the grasp a little longer before clicking STOP & CLASSIFY."
+        )
+    return predict_from_raw(t, s1, s2, s3, return_proba=True)
+
+
+# ============================================================
+# LIVE APP (real serial hardware + animation loop) -- only runs when this
+# file is executed directly, so the pure functions above stay importable
+# and testable without a serial port attached.
+# ============================================================
+
+def _select_port():
+    import serial.tools.list_ports
+    ports = list(serial.tools.list_ports.comports())
+    print()
+    print("=" * 72)
+    print(" UNIVERSAL ARM - LIVE GRASP CLASSIFIER")
+    print("=" * 72)
+    if not ports:
+        print("No COM port detected.")
+        input("Press Enter to exit...")
+        raise SystemExit
+    print()
+    print("AVAILABLE COM PORTS")
+    print("-" * 72)
+    for i, port in enumerate(ports):
+        print(f"[{i}] {port.device:<8} | {port.description}")
+    print("-" * 72)
+    if len(ports) == 1:
+        return ports[0].device
+    while True:
+        try:
+            selection = int(input("\nSelect ESP32 port number: "))
+            if 0 <= selection < len(ports):
+                return ports[selection].device
+            print("Please select a valid number.")
+        except ValueError:
+            print("Please enter a number.")
+
+
+def _connect(port):
+    import serial
+    print()
+    print("Connecting...")
+    print("PORT :", port)
+    print("BAUD :", BAUD_RATE)
+    try:
+        ser = serial.Serial(port, BAUD_RATE, timeout=0.01)
+        time.sleep(2)
+        ser.reset_input_buffer()
+    except Exception as e:
+        print()
+        print("Serial connection failed:")
+        print(e)
+        print()
+        print("Close the Arduino Serial Monitor / Serial Plotter.")
+        input("Press Enter to exit...")
+        raise SystemExit
+    print()
+    print("Connected successfully.")
+    print("Waiting for ESP32 data...")
+    print()
+    return ser
 
 
 def main():
-    root = tk.Tk()
-    style = ttk.Style()
+    from matplotlib.animation import FuncAnimation
+
+    port = _select_port()
+    ser = _connect(port)
+
+    handles = build_figure()
+
+    capturing = False
+    last_packet_format = "No packet yet"
+    valid_packet_count = 0
+    invalid_packet_count = 0
+    program_start_time = time.perf_counter()
+
+    time_buffer = deque(maxlen=WINDOW_SIZE)
+    sensor_buffers = [deque(maxlen=WINDOW_SIZE) for _ in range(3)]
+
+    grasp_t, grasp_s1, grasp_s2, grasp_s3 = [], [], [], []
+    grasp_start_time = None
+
+    def read_serial_packets():
+        nonlocal valid_packet_count, invalid_packet_count, last_packet_format
+        nonlocal grasp_start_time
+        samples = []
+        for _ in range(100):
+            try:
+                raw = ser.readline()
+            except Exception as e:
+                print("SERIAL READ ERROR:", e)
+                break
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            values, fmt = parse_packet(line)
+            if values is None:
+                invalid_packet_count += 1
+                continue
+            last_packet_format = fmt
+            valid_packet_count += 1
+            program_time = time.perf_counter() - program_start_time
+            samples.append((program_time, values[0], values[1], values[2]))
+
+            if capturing:
+                if grasp_start_time is None:
+                    grasp_start_time = program_time
+                grasp_t.append(program_time - grasp_start_time)
+                grasp_s1.append(values[0])
+                grasp_s2.append(values[1])
+                grasp_s3.append(values[2])
+        return samples
+
+    def start_grasp(event=None):
+        nonlocal capturing, grasp_start_time
+        if capturing:
+            return
+        grasp_t.clear(); grasp_s1.clear(); grasp_s2.clear(); grasp_s3.clear()
+        grasp_start_time = None
+        capturing = True
+        set_prediction_text(handles, message="Recording grasp...\nclick STOP & CLASSIFY when done.")
+        handles["fig"].canvas.draw_idle()
+
+    def stop_and_classify(event=None):
+        nonlocal capturing
+        if not capturing:
+            return
+        capturing = False
+        try:
+            label, proba = classify_grasp(grasp_t, grasp_s1, grasp_s2, grasp_s3)
+        except ValueError as e:
+            set_prediction_text(handles, message=f"Grasp too short:\n{e}")
+            handles["fig"].canvas.draw_idle()
+            return
+        except Exception as e:
+            set_prediction_text(handles, message=f"Classification failed:\n{e}")
+            handles["fig"].canvas.draw_idle()
+            return
+
+        duration = grasp_t[-1] if grasp_t else 0.0
+        log_prediction(label, proba, len(grasp_t), duration)
+
+        highlight_prediction(handles, label)
+        set_prediction_text(handles, label=label, proba=proba)
+        handles["fig"].canvas.draw_idle()
+
+        popup = build_popup_figure(label, proba.get(label, 0.0))
+        plt.show(block=False)
+
+    handles["start_button"].on_clicked(start_grasp)
+    handles["stop_button"].on_clicked(stop_and_classify)
+
+    def update(frame):
+        samples = read_serial_packets()
+        for t, s1, s2, s3 in samples:
+            time_buffer.append(t)
+            sensor_buffers[0].append(s1)
+            sensor_buffers[1].append(s2)
+            sensor_buffers[2].append(s3)
+        update_live_plot(handles, time_buffer, sensor_buffers)
+        state = "RECORDING GRASP" if capturing else "LIVE"
+        handles["status_text"].set_text(
+            f"STATUS: {state}\n"
+            f"Grasp samples: {len(grasp_t)}\n"
+            f"Valid packets: {valid_packet_count}  Invalid: {invalid_packet_count}\n"
+            f"Packet: {last_packet_format}"
+        )
+        return handles["lines"] + handles["value_texts"]
+
+    ani = FuncAnimation(handles["fig"], update, interval=GRAPH_INTERVAL_MS, blit=False, cache_frame_data=False)
+
     try:
-        style.theme_use("clam")
-    except tk.TclError:
-        pass
-    ClassifierApp(root)
-    root.mainloop()
+        plt.show()
+    finally:
+        if ser.is_open:
+            ser.close()
+        print()
+        print("=" * 72)
+        print("PROGRAM CLOSED")
+        print("Valid packets  :", valid_packet_count)
+        print("Invalid packets:", invalid_packet_count)
+        print("=" * 72)
 
 
 if __name__ == "__main__":

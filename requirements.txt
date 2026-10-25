@@ -1,11 +1,16 @@
-# Tested with Python 3.10.
-# Pinned to what the model was trained/saved with -- scikit-learn pickles
-# (joblib) can fail to load across major version jumps, so keep these exact
-# for now. If you need to loosen them later, retrain with train_model.py
-# afterwards to regenerate model.joblib against the new versions.
+# Tested with Python 3.10 and 3.14.
+# scikit-learn pickles (joblib) can fail to load across major version jumps,
+# so pandas / scikit-learn / joblib are pinned to exactly what model.joblib
+# was trained/saved with. numpy and scipy are pinned to the earliest release
+# that ships a Python 3.14 wheel (2.2.6 / 1.15.3 had none -- pip tried to
+# compile them from source, which is what failed) rather than to the exact
+# training version, but this is a routine minor-version bump and should not
+# affect the model's predictions. If you ever need to loosen these further,
+# retrain with train_model.py afterwards to regenerate model.joblib against
+# the new versions.
 pandas==2.3.3
-numpy==2.2.6
-scipy==1.15.3
+numpy==2.3.2
+scipy==1.16.1
 scikit-learn==1.7.2
 joblib==1.6.0
 
